@@ -31,6 +31,12 @@ class RLDSDataset:
     version: str
     weight: float
     filter_dict_path: str | None = None
+    # If set, load with ``tfds.builder_from_directory`` (e.g. ``data/droid_100/1.0.0_CRI``).
+    # When set, ``name`` / ``version`` are only used for logging.
+    builder_dir: str | None = None
+    # Optional CRI sidecar from ``python -m openpi.cri.annotate_rlds_addon`` (no full RLDS copy).
+    # When set with ``include_cri=True``, joins ``observation/cri`` by episode key.
+    cri_addon_dir: str | None = None
 
 
 class DroidRldsDataset:
@@ -49,6 +55,7 @@ class DroidRldsDataset:
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+        include_cri: bool = False,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
@@ -64,7 +71,14 @@ class DroidRldsDataset:
         def prepare_single_dataset(dataset_cfg: RLDSDataset):
             # ds_name, version = dataset_name.split(":")
             ds_name, version = dataset_cfg.name, dataset_cfg.version
-            builder = tfds.builder(ds_name, data_dir=data_dir, version=version)
+            if dataset_cfg.builder_dir is not None:
+                builder_path = Path(dataset_cfg.builder_dir).expanduser().resolve()
+                if not builder_path.is_dir():
+                    raise FileNotFoundError(f"RLDS builder_dir not found: {builder_path}")
+                builder = tfds.builder_from_directory(str(builder_path))
+                logging.info(f"Loading RLDS from builder_dir={builder_path}")
+            else:
+                builder = tfds.builder(ds_name, data_dir=data_dir, version=version)
             dataset = dl.DLataset.from_rlds(
                 builder, split="train", shuffle=shuffle, num_parallel_reads=num_parallel_reads
             )
@@ -112,6 +126,14 @@ class DroidRldsDataset:
                     tf.lookup.KeyValueTensorInitializer([""], [True]), default_value=True
                 )
 
+            cri_addon_reader = None
+            if include_cri and dataset_cfg.cri_addon_dir is not None:
+                from openpi.cri.addon import CriAddonReader
+                from openpi.cri.constants import NUM_CRI_POINTS
+
+                cri_addon_reader = CriAddonReader(Path(dataset_cfg.cri_addon_dir))
+                logging.info(f"Using CRI addon at {dataset_cfg.cri_addon_dir} ({len(cri_addon_reader.entries)} episodes)")
+
             def restructure(traj):
                 """Reformat observation and action keys, sample language instruction."""
                 # Important: we use joint *position* action space -- easier to simulate!
@@ -155,14 +177,41 @@ class DroidRldsDataset:
                 )
                 passes_filter = self.filter_table.lookup(step_id)
 
+                observation = {
+                    "image": exterior_img,
+                    "wrist_image": wrist_img,
+                    "joint_position": traj["observation"]["joint_position"],
+                    "gripper_position": traj["observation"]["gripper_position"],
+                }
+                if include_cri:
+                    if cri_addon_reader is not None:
+                        # Join sidecar by episode key (recording_folderpath--file_path).
+                        rec0 = traj["traj_metadata"]["episode_metadata"]["recording_folderpath"][0]
+                        fp0 = traj["traj_metadata"]["episode_metadata"]["file_path"][0]
+
+                        def _lookup_cri(rec, fp, length):
+                            from openpi.cri.addon import episode_key as _episode_key
+
+                            key = _episode_key(rec.numpy(), fp.numpy())
+                            if key not in cri_addon_reader:
+                                raise KeyError(f"CRI addon missing episode key: {key}")
+                            cri_np = cri_addon_reader.get_cri(key)
+                            length_i = int(length.numpy())
+                            if cri_np.shape[0] < length_i:
+                                raise ValueError(
+                                    f"CRI addon length {cri_np.shape[0]} < traj_len {length_i} for {key}"
+                                )
+                            return cri_np[:length_i]
+
+                        cri = tf.py_function(_lookup_cri, [rec0, fp0, traj_len], Tout=tf.float32)
+                        cri.set_shape([None, NUM_CRI_POINTS])
+                        observation["cri"] = cri
+                    else:
+                        observation["cri"] = traj["observation"]["cri"]
+
                 return {
                     "actions": actions,
-                    "observation": {
-                        "image": exterior_img,
-                        "wrist_image": wrist_img,
-                        "joint_position": traj["observation"]["joint_position"],
-                        "gripper_position": traj["observation"]["gripper_position"],
-                    },
+                    "observation": observation,
                     "prompt": instruction,
                     "step_id": step_id,
                     "passes_filter": passes_filter,
@@ -224,13 +273,18 @@ class DroidRldsDataset:
         logging.info(f"Preparing {len(datasets)} datasets...")
         logging.info("-" * 50)
         for dataset in datasets:
-            logging.info(f"    {dataset.name}:{dataset.version} with weight {dataset.weight:.2f}")
+            loc = dataset.builder_dir or f"{dataset.name}:{dataset.version}"
+            addon = f", cri_addon={dataset.cri_addon_dir}" if dataset.cri_addon_dir else ""
+            logging.info(f"    {loc} with weight {dataset.weight:.2f} (include_cri={include_cri}{addon})")
         logging.info("-" * 50)
         all_datasets = [prepare_single_dataset(dataset) for dataset in datasets]
         weights = [dataset.weight for dataset in datasets]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
-        final_dataset = final_dataset.shuffle(shuffle_buffer_size)
+        # Skip shuffle for norm-stats / deterministic passes — a 250k frame buffer of
+        # decoded images routinely OOMs host RAM (exit 137) on single-workstation machines.
+        if shuffle:
+            final_dataset = final_dataset.shuffle(shuffle_buffer_size)
         final_dataset = final_dataset.batch(batch_size)
         # Note =>> Seems to reduce memory usage without affecting speed?
         final_dataset = final_dataset.with_ram_budget(1)

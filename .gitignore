@@ -12,6 +12,10 @@ __pycache__/
 # C extensions
 *.so
 
+# ONNX / TensorRT engine artifacts
+*.onnx
+*.engine
+
 # Distribution / packaging
 .Python
 build/

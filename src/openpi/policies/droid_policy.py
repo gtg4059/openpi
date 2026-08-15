@@ -31,6 +31,9 @@ def _parse_image(image) -> np.ndarray:
 class DroidInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType
+    # If True, forward observation/cri as a separate ``cri`` field for LLM tokenization
+    # (not concatenated into continuous proprio state).
+    use_cri: bool = False
 
     def __call__(self, data: dict) -> dict:
         gripper_pos = np.asarray(data["observation/gripper_position"])
@@ -62,6 +65,11 @@ class DroidInputs(transforms.DataTransformFn):
             "image": dict(zip(names, images, strict=True)),
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
+
+        if self.use_cri:
+            if "observation/cri" not in data:
+                raise KeyError("use_cri=True but observation/cri is missing from the batch")
+            inputs["cri"] = np.asarray(data["observation/cri"], dtype=np.float32).reshape(-1)
 
         if "actions" in data:
             inputs["actions"] = np.asarray(data["actions"])

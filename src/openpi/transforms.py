@@ -213,7 +213,7 @@ class DeltaActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state, actions = data["state"], np.array(data["actions"], copy=True)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -235,7 +235,7 @@ class AbsoluteActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state, actions = data["state"], np.array(data["actions"], copy=True)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -248,6 +248,8 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    # If True, expect a ``cri`` array and encode it as a separate ``CRI: ...`` token span.
+    discrete_cri_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -259,11 +261,19 @@ class TokenizePrompt(DataTransformFn):
         else:
             state = None
 
+        cri = None
+        if self.discrete_cri_input:
+            if (cri := data.get("cri", None)) is None:
+                raise ValueError("CRI is required when discrete_cri_input=True")
+            cri = np.asarray(cri, dtype=np.float32).reshape(-1)
+
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
-        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state, cri=cri)
+        # Drop cri so it is not forwarded into model Observation.
+        out = {k: v for k, v in data.items() if k != "cri"}
+        return {**out, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
 @dataclasses.dataclass(frozen=True)

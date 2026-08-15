@@ -8,6 +8,30 @@ import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
+# Repo root: src/openpi/training/config.py -> parents[3]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+
+
+def _resolve_existing_dir(*candidates: str) -> pathlib.Path:
+    """Return the first existing directory, else the preferred (first) candidate."""
+    for candidate in candidates:
+        path = pathlib.Path(candidate)
+        if path.is_dir():
+            return path
+    return pathlib.Path(candidates[0])
+
+
+# Fixed full-DROID + CRI sidecar locations (TacVLA-style CRI-token fine-tune).
+# E: may be mounted at /mnt/E (current) or legacy /media/safetics/E.
+_DROID_RLDS_DIR = pathlib.Path("/media/safetics/D/droid/1.0.1")
+_E_ROOT = _resolve_existing_dir("/mnt/E", "/media/safetics/E")
+_CRI_ADDON_DIR = _E_ROOT / "droid_1.0.1_cri_addon"
+_TRAIN_OUTPUT_DIR = _REPO_ROOT / "data"
+# Large Orbax checkpoints (~9–11 GiB each) go to E: to avoid filling root (/).
+_CHECKPOINT_OUTPUT_DIR = _E_ROOT / "openpi" / "checkpoints"
+# Pretrained init weights on E: (avoid downloading ~12 GiB into ~/.cache on start).
+_PRETRAINED_PI05_DROID_PARAMS = _E_ROOT / "openpi" / "pretrained" / "pi05_droid" / "params"
+
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
@@ -96,6 +120,12 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # Append observation/cri to proprioceptive state (DROID+CRI RLDS).
+    include_cri: bool = False
+    # Optional CRI sidecar directory (see ``openpi.cri.annotate_rlds_addon``).
+    cri_addon_dir: str | None = None
+    # RLDS shuffle buffer; lower for small debug sets like droid_100.
+    rlds_shuffle_buffer_size: int = 250_000
 
 
 class GroupFactory(Protocol):
@@ -363,6 +393,10 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
     rlds_data_dir: str | None = None
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+    include_cri: bool = False
+    # CRI sidecar dir applied to every dataset entry (see ``openpi.cri.annotate_rlds_addon``).
+    cri_addon_dir: str | None = None
+    rlds_shuffle_buffer_size: int = 250_000
 
     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
@@ -380,23 +414,23 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/exterior_image_1_left": "observation/image",
+            "observation/wrist_image_left": "observation/wrist_image",
+            "observation/joint_position": "observation/joint_position",
+            "observation/gripper_position": "observation/gripper_position",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.include_cri:
+            repack_structure["observation/cri"] = "observation/cri"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "observation/image",
-                        "observation/wrist_image_left": "observation/wrist_image",
-                        "observation/joint_position": "observation/joint_position",
-                        "observation/gripper_position": "observation/gripper_position",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type, use_cri=self.include_cri)],
             outputs=[droid_policy.DroidOutputs()],
         )
 
@@ -408,9 +442,34 @@ class RLDSDroidDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory()(model_config)
+        if self.include_cri:
+            # CRI is encoded as a separate discrete token span (``CRI: ...``), not continuous state.
+            if not isinstance(model_config, pi0_config.Pi0Config) or not model_config.pi05:
+                raise ValueError("include_cri currently requires a Pi05 model config")
+            # Extra room for ``, CRI: <9 bins>`` in the language prefix.
+            token_len = max(model_config.max_token_len, 220)
+            model_transforms = _transforms.Group(
+                inputs=[
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                        discrete_cri_input=True,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ],
+            )
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
 
         assert self.rlds_data_dir is not None, "Need to set rlds data dir for RLDS data loader."
+
+        datasets = self.datasets
+        if self.cri_addon_dir is not None:
+            datasets = tuple(
+                dataclasses.replace(ds, cri_addon_dir=self.cri_addon_dir) for ds in datasets
+            )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -419,7 +478,10 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
-            datasets=self.datasets,
+            datasets=datasets,
+            include_cri=self.include_cri,
+            cri_addon_dir=self.cri_addon_dir,
+            rlds_shuffle_buffer_size=self.rlds_shuffle_buffer_size,
         )
 
 
@@ -533,6 +595,16 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # Convenience CLI overrides for RLDS dataset location (applied in ``cli()`` / ``apply_rlds_path_overrides``).
+    # Prefer these over nested ``--data.rlds-data-dir`` / ``--data.datasets.0.builder-dir``.
+    # Example:
+    #   --rlds-builder-dir=/media/safetics/D/droid_100/1.0.0_CRI
+    #   --rlds-data-dir=/media/safetics/D
+    #   --cri-addon-dir=/home/safetics/openpi/data/droid_1.0.1_cri_addon
+    rlds_data_dir: str | None = None
+    rlds_builder_dir: str | None = None
+    cri_addon_dir: str | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -916,6 +988,129 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    TrainConfig(
+        # Full DROID 1.0.1 (D:) + CRI sidecar (E:), TacVLA-style discrete safety tokens.
+        # CRI is not continuous state; language prefix is:
+        #   Task: ..., State: ..., CRI: <9 bins>;
+        #   Action:
+        # Analogous to TacVLA (arXiv:2603.12665): pi05_droid + LoRA + compact non-vision modality tokens.
+        # Outputs:
+        #   checkpoints → <E>/openpi/checkpoints/pi05_droid_cri_finetune/<exp_name>
+        #   norm stats  → data/assets/pi05_droid_cri_finetune/droid_cri
+        # Run via: ``uv run --group rlds scripts/train_pi05_droid_cri.py --exp-name=my_experiment --overwrite``
+        name="pi05_droid_cri_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            max_token_len=220,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RLDSDroidDataConfig(
+            repo_id="droid_cri",
+            rlds_data_dir=str(_DROID_RLDS_DIR.parent.parent),  # /media/safetics/D
+            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            include_cri=True,
+            cri_addon_dir=str(_CRI_ADDON_DIR),
+            # Host RAM ~125GiB; default 250k image shuffle OOM-killed python (~121GiB RSS).
+            # 50k ran to step 2000; 32k leaves headroom for Orbax save + monitor.
+            rlds_shuffle_buffer_size=32_000,
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    name="droid",
+                    version="1.0.1",
+                    weight=1.0,
+                    filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
+                    builder_dir=str(_DROID_RLDS_DIR),
+                    cri_addon_dir=str(_CRI_ADDON_DIR),
+                ),
+            ),
+            assets=AssetsConfig(
+                asset_id="droid_cri",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PRETRAINED_PI05_DROID_PARAMS)),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        # TacVLA used 10k; we run longer LoRA finetune (resume from 10k checkpoint OK).
+        num_train_steps=30_000,
+        # Single RTX PRO 6000 (~96GiB): bs16 OOM at restore; bs8 stable.
+        batch_size=8,
+        log_interval=100,
+        save_interval=1_000,
+        keep_period=2_000,
+        num_workers=0,  # RLDS loader manages its own parallelism
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            max_token_len=220,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # recommended for LoRA
+        # Checkpoints on E: (large); norm-stats assets stay on repo data/.
+        checkpoint_base_dir=str(_CHECKPOINT_OUTPUT_DIR),
+        assets_base_dir=str(_TRAIN_OUTPUT_DIR / "assets"),
+        # Requires wandb>=0.22.3 for new-format ``wandb_v1_`` API keys.
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        # Debug / smoke fine-tune of pi05_base on CRI-annotated droid_100 RLDS.
+        # Dataset: data/droid_100/1.0.0_CRI (produced by ``python -m openpi.cri.annotate_rlds``).
+        # Full DROID+CRI training can later clone this and point builder_dir / scale up steps.
+        # Run via: ``uv run --group rlds scripts/train_pi05_droid_100_cri.py --exp-name=my_experiment --overwrite``
+        # or: ``uv run --group rlds scripts/train.py pi05_droid_100_cri_finetune --exp-name=my_experiment --overwrite``
+        name="pi05_droid_100_cri_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            max_token_len=220,  # room for separate ``CRI: ...`` token span
+        ),
+        data=RLDSDroidDataConfig(
+            repo_id="droid_100_cri",
+            # Parent of dataset name dirs; unused when builder_dir is set, but required by assert.
+            rlds_data_dir=str(_REPO_ROOT / "data"),
+            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            include_cri=True,  # LLM tokens: ``Task: ..., State: ..., CRI: ...;``
+            rlds_shuffle_buffer_size=2_000,
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    name="droid_100",
+                    version="1.0.0",
+                    weight=1.0,
+                    filter_dict_path=None,
+                    builder_dir=str(_REPO_ROOT / "data" / "droid_100" / "1.0.0_CRI"),
+                ),
+            ),
+            assets=AssetsConfig(
+                # Loaded from ``assets/pi05_droid_100_cri_finetune/droid_100_cri`` after compute_norm_stats.
+                asset_id="droid_100_cri",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=20,
+        # Single-GPU smoke: full pi05 + bs8 OOMs (~50GiB); keep tiny for debug.
+        batch_size=2,
+        log_interval=1,
+        save_interval=10,
+        keep_period=20,
+        num_workers=0,
+        wandb_enabled=False,
+        ema_decay=None,  # save memory during smoke runs
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
@@ -975,8 +1170,33 @@ if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
+def apply_rlds_path_overrides(config: TrainConfig) -> TrainConfig:
+    """Copy top-level RLDS/CRI path overrides onto an RLDS data config."""
+    if config.rlds_data_dir is None and config.rlds_builder_dir is None and config.cri_addon_dir is None:
+        return config
+    data = config.data
+    if not isinstance(data, RLDSDroidDataConfig):
+        raise ValueError(
+            "--rlds-data-dir / --rlds-builder-dir / --cri-addon-dir require an RLDS DROID data config "
+            f"(got {type(data).__name__})"
+        )
+    new_data = data
+    if config.rlds_data_dir is not None:
+        new_data = dataclasses.replace(new_data, rlds_data_dir=config.rlds_data_dir)
+    if config.rlds_builder_dir is not None:
+        datasets = tuple(
+            dataclasses.replace(ds, builder_dir=config.rlds_builder_dir) for ds in new_data.datasets
+        )
+        new_data = dataclasses.replace(new_data, datasets=datasets)
+    if config.cri_addon_dir is not None:
+        new_data = dataclasses.replace(new_data, cri_addon_dir=config.cri_addon_dir)
+    return dataclasses.replace(config, data=new_data)
+
+
 def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+    return apply_rlds_path_overrides(
+        tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+    )
 
 
 def get_config(config_name: str) -> TrainConfig:

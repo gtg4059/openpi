@@ -166,6 +166,8 @@ def create_rlds_dataset(
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
         datasets=data_config.datasets,
+        include_cri=data_config.include_cri,
+        shuffle_buffer_size=data_config.rlds_shuffle_buffer_size,
     )
 
 

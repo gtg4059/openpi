@@ -113,11 +113,35 @@ def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
         )
         _download_fsspec(url, local_path, **kwargs)
         return
-    local_path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["gsutil", "-m", "cp", "-r", f"{url}/*", str(local_path)],
+
+    # ``gsutil cp -r url/*`` only works for directories. Idle-filter assets are single JSON files.
+    probe = subprocess.run(
+        ["gsutil", "ls", "-d", url],
         check=True,
+        capture_output=True,
+        text=True,
     )
+    listed = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+    is_dir = bool(listed) and listed[0].endswith("/")
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists():
+        if local_path.is_dir():
+            shutil.rmtree(local_path)
+        else:
+            local_path.unlink()
+
+    if is_dir:
+        local_path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["gsutil", "-m", "cp", "-r", f"{url.rstrip('/')}/*", str(local_path)],
+            check=True,
+        )
+    else:
+        subprocess.run(
+            ["gsutil", "-m", "cp", url, str(local_path)],
+            check=True,
+        )
 
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:

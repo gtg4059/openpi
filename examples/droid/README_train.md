@@ -41,6 +41,76 @@ Run training:
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --group rlds scripts/train.py pi05_full_droid_finetune --exp-name=my_experiment --overwrite
 ```
 
+### Full DROID 1.0.1 + CRI sidecar (TacVLA-style tokens)
+
+Fixed layout used by this workspace:
+
+- DROID RLDS: `/media/safetics/D/droid/1.0.1`
+- CRI addon: `/mnt/E/droid_1.0.1_cri_addon` (legacy: `/media/safetics/E/...`)
+- Pretrained init (`pi05_droid`, ~12 GiB): `/mnt/E/openpi/pretrained/pi05_droid`
+- Checkpoints: `/mnt/E/openpi/checkpoints/pi05_droid_cri_finetune/<exp_name>`
+
+CRI is fused like TacVLA's compact non-vision tokens: discrete LLM span
+`Task: ..., State: ..., CRI: <9 bins>;` on top of `pi05_droid` + LoRA
+(config `pi05_droid_cri_finetune`).
+
+Keep the init checkpoint on E: so training does not download into `~/.cache`
+(root disk is tight). The helper downloads it automatically if missing.
+Code resolves E as `/mnt/E` if present, else `/media/safetics/E`.
+
+```bash
+# Optional: prefetch pretrained weights yourself
+mkdir -p /mnt/E/openpi/pretrained/pi05_droid
+gsutil -m cp -r gs://openpi-assets/checkpoints/pi05_droid/* \
+  /mnt/E/openpi/pretrained/pi05_droid/
+
+# Build sidecar once (if needed; resumable)
+uv run --group rlds python -m openpi.cri.annotate_rlds_addon \
+  --source-dir=/media/safetics/D/droid/1.0.1 \
+  --addon-dir=/mnt/E/droid_1.0.1_cri_addon
+
+# Start training (norm stats + LoRA fine-tune)
+uv run --group rlds scripts/train_pi05_droid_cri.py \
+  --exp-name=droid_cri_lora --overwrite
+```
+
+### Debug: pi0.5-base on `droid_100` + CRI (RLDS)
+
+Before full-scale DROID+CRI training, smoke-test the pipeline on the annotated subset
+`data/droid_100/1.0.0_CRI` (created by `python -m openpi.cri.annotate_rlds`).
+
+This is the sibling of the custom LeRobot entrypoint
+`uv run scripts/train.py pi05_droid_finetune --exp-name=my_experiment --overwrite`,
+but uses RLDS + `pi05_base`. CRI is **not** concatenated into continuous state; it is
+encoded as a separate discrete language span:
+`Task: ..., State: ..., CRI: <9 bins>;\nAction: `.
+
+```bash
+# One-shot helper (norm stats + short train)
+uv run --group rlds scripts/train_pi05_droid_100_cri.py --exp-name=my_experiment --overwrite
+
+# Or step-by-step (same pattern as full DROID above):
+uv run --group rlds scripts/compute_norm_stats.py \
+  --config-name pi05_droid_100_cri_finetune --max-frames 5000
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --group rlds scripts/train.py \
+  pi05_droid_100_cri_finetune --exp-name=my_experiment --overwrite
+```
+
+Override the RLDS location on the command line (no config edit needed), e.g. when data lives under `/media/safetics/D`:
+
+```bash
+# Version folder used by ``tfds.builder_from_directory`` (preferred for CRI smoke config)
+--rlds-builder-dir=/media/safetics/D/droid_100/1.0.0_CRI
+
+# Or TFDS parent data dir (used when builder_dir is unset)
+--rlds-data-dir=/media/safetics/D
+```
+
+These flags work on `scripts/train.py`, `scripts/compute_norm_stats.py`, and `scripts/train_pi05_droid_100_cri.py`.
+
+Config name: `pi05_droid_100_cri_finetune` (small batch/steps; `wandb` off by default).
+
 **Note**: The original pi0.5-DROID model was trained with joint velocity actions.
 Joint velocity actions are not compatible with simulated evaluation environments (much harder to simulate). 
 Thus, we do not recommend training with joint velocity actions and instead use joint position actions here.

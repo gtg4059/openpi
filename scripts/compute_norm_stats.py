@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+
 import numpy as np
 import tqdm
 import tyro
@@ -86,17 +88,49 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    *,
+    batch_size: int | None = None,
+    rlds_data_dir: str | None = None,
+    rlds_builder_dir: str | None = None,
+    cri_addon_dir: str | None = None,
+):
+    """Compute norm stats.
+
+    Optional RLDS path overrides (same meaning as ``scripts/train.py``)::
+
+        --rlds-builder-dir=/media/safetics/D/droid_100/1.0.0_CRI
+        --rlds-data-dir=/media/safetics/D
+        --cri-addon-dir=/mnt/E/droid_1.0.1_cri_addon
+    """
     config = _config.get_config(config_name)
+    config = _config.apply_rlds_path_overrides(
+        dataclasses.replace(
+            config,
+            rlds_data_dir=rlds_data_dir,
+            rlds_builder_dir=rlds_builder_dir,
+            cri_addon_dir=cri_addon_dir,
+        )
+    )
     data_config = config.data.create(config.assets_dirs, config.model)
+    # Norm-stats only needs state/actions; keep batch small to limit host RAM
+    # (idle-filter table + image decode already dominate memory).
+    stats_batch_size = int(batch_size) if batch_size is not None else min(int(config.batch_size), 4)
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
+            data_config, config.model.action_horizon, stats_batch_size, max_frames
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            config.model.action_horizon,
+            stats_batch_size,
+            config.model,
+            config.num_workers,
+            max_frames,
         )
 
     keys = ["state", "actions"]
@@ -106,7 +140,7 @@ def main(config_name: str, max_frames: int | None = None):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    norm_stats = {key: key_stats.get_statistics() for key, key_stats in stats.items()}
 
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")
