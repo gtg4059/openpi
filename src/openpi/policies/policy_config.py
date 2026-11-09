@@ -72,9 +72,17 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    serve_inputs = []
+    if getattr(data_config, "include_cri", False):
+        from openpi.policies import droid_policy as _droid_policy
+
+        # Robot clients do not send CRI; compute delayed cri_pre on the GPU server.
+        serve_inputs = [_droid_policy.AliasDroidRobotObs(), _droid_policy.AttachLiveCri()]
+
     return _policy.Policy(
         model,
         transforms=[
+            *serve_inputs,
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,

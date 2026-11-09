@@ -1,10 +1,11 @@
 """Build a CRI-annotated RLDS copy of a DROID dataset (default: ``data/droid_100``).
 
-Pipeline (matches IsaacLab reach CRI path + offline finite-diff velocity):
+Pipeline matches IsaacLab CRI-F (``cri_filter_pre`` / ``cri_F_reach_env_cfg``):
 
 1. Load source RLDS episodes (``observation/joint_position``).
 2. Estimate ``qd`` with first step ``0``, then ``(q[t]-q[t-1])/dt``.
-3. Compute ``CRI(q, qd)`` via ``CriSolver`` (bundled Panda analysis under ``openpi.cri``).
+3. Solve ``run_cri_filter(q, qd)`` and store the **previous-step** ``cri_pre``
+   (t=0 is 0; later ticks read the prior solve). CBF-QP stays off for annotation.
 4. Write a new RLDS dataset with ``observation/cri`` and ``observation/joint_velocity``.
 
 Example::
@@ -27,13 +28,14 @@ import numpy as np
 import tqdm
 import tyro
 
-from openpi.cri.compute import compute_cri
+from openpi.cri.constants import CBF_ALPHA
+from openpi.cri.constants import CRI_FILTER_LIMIT
 from openpi.cri.constants import DEFAULT_NUM_JOINTS
 from openpi.cri.constants import DROID_CONTROL_DT
 from openpi.cri.constants import NUM_CRI_POINTS
 from openpi.cri.constants import PACKAGE_DIR
+from openpi.cri.filter import compute_episode_cri_f
 from openpi.cri.solver import CriSolver
-from openpi.cri.velocity import joint_velocity_from_positions
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +75,7 @@ def build_cri_features(source_features: Any) -> Any:
             "cri": tfds.features.Tensor(
                 shape=(NUM_CRI_POINTS,),
                 dtype=np.float32,
-                doc="Collision Risk Index per Panda collision point (clamped, zero-vel filtered)",
+                doc="IsaacLab CRI-F delayed cri_pre (t=0 is 0; later ticks use the previous solve)",
             ),
         }
     )
@@ -93,30 +95,22 @@ def compute_episode_cri(
     *,
     solver: Any,
     dt: float = DROID_CONTROL_DT,
+    cri_limit: float = CRI_FILTER_LIMIT,
+    cbf_alpha: float = CBF_ALPHA,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(qd, cri)`` for one episode.
+    """Return ``(qd, cri)`` for one episode (IsaacLab CRI-F, 1-step delayed).
 
     Args:
         joint_positions: ``(T, 7)`` observation joint positions.
-        solver: ``CriSolver`` (or duck-typed stand-in with ``batch_size`` + ``compute``).
+        solver: ``CriSolver`` (or duck-typed stand-in with ``run_cri_filter``).
         dt: Control timestep seconds.
 
     Returns:
-        ``qd`` float64 ``(T, 7)``, ``cri`` float32 ``(T, 8)``.
+        ``qd`` float64 ``(T, 7)``, delayed ``cri`` float32 ``(T, NUM_CRI_POINTS)``.
     """
-    q = np.asarray(joint_positions, dtype=np.float64)
-    if q.ndim != 2 or q.shape[-1] < DEFAULT_NUM_JOINTS:
-        raise ValueError(f"expected joint_positions (T, >=7), got {q.shape}")
-    q = q[:, :DEFAULT_NUM_JOINTS]
-    qd = joint_velocity_from_positions(q, dt=dt)
-
-    t_len = q.shape[0]
-    batch = int(solver.batch_size)
-    cri_chunks: list[np.ndarray] = []
-    for start in range(0, t_len, batch):
-        end = min(start + batch, t_len)
-        cri_chunks.append(compute_cri(q[start:end], qd[start:end], solver=solver))
-    cri = np.concatenate(cri_chunks, axis=0).astype(np.float32, copy=False)
+    qd, cri, _delta, _qd_cmd = compute_episode_cri_f(
+        joint_positions, solver=solver, dt=dt, cri_limit=cri_limit, cbf_alpha=cbf_alpha
+    )
     return qd, cri
 
 
@@ -258,7 +252,7 @@ def write_annotated_rlds(
         description=(
             f"CRI-annotated DROID RLDS derived from {source_dir}. "
             f"observation/joint_velocity is finite-diff (dt={dt}, first step 0); "
-            f"observation/cri is Safetics CRI ({NUM_CRI_POINTS} points)."
+            f"observation/cri is IsaacLab CRI-F delayed cri_pre ({NUM_CRI_POINTS} points)."
         ),
     )
     logger.info("Wrote %d episodes → %s", written, output_dir)
@@ -303,15 +297,24 @@ class Args:
 
 
 class _MockCriSolver:
-    """CPU stand-in that returns zeros (still runs zero-vel filter via compute_cri)."""
+    """CPU stand-in that returns zero cri_pre and qd_cmd=qd_RL."""
 
-    def __init__(self, batch_size: int = 256) -> None:
+    def __init__(self, batch_size: int = 256, cri_limit: float = CRI_FILTER_LIMIT) -> None:
         self.batch_size = int(batch_size)
+        self._cri_limit = float(cri_limit)
 
-    def compute(self, q: Any, qd: Any, *, return_torch: bool = False) -> np.ndarray:
-        del return_torch, qd
+    def run_cri_filter(self, q: Any, qd: Any) -> dict[str, Any]:
         batch = int(np.asarray(q).reshape(-1, np.asarray(q).shape[-1]).shape[0])
-        return np.zeros((batch, NUM_CRI_POINTS), dtype=np.float32)
+        qd_rl = np.asarray(qd, dtype=np.float32).reshape(batch, -1)
+        return {
+            "cri_pre": np.zeros((batch, NUM_CRI_POINTS), dtype=np.float32),
+            "qd_cmd": qd_rl,
+            "delta": np.zeros((batch,), dtype=np.float32),
+            "cri_limit": self._cri_limit,
+            "cbf_alpha": CBF_ALPHA,
+            "approach_limit": self._cri_limit * (1.0 - CBF_ALPHA),
+            "enabled": False,
+        }
 
 
 def main(args: Args) -> None:
@@ -325,6 +328,10 @@ def main(args: Args) -> None:
             batch_size=args.batch_size,
             num_joints=DEFAULT_NUM_JOINTS,
             warmup_rounds=args.warmup_rounds,
+            cri_filter=True,
+            cri_limit=CRI_FILTER_LIMIT,
+            cbf_alpha=CBF_ALPHA,
+            filter_enabled=False,
         )
     out = write_annotated_rlds(
         source_dir=args.source_dir,

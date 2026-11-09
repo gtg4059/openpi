@@ -1,9 +1,12 @@
-"""Fine-tune pi05_droid on full DROID + CRI sidecar (TacVLA-style modality tokens).
+"""LoRA fine-tune pi05_droid on full DROID + CRI-F sidecar v3 (no time-scale s).
+
+Sidecar must be ``openpi_cri_addon_v3``: delayed ``cri_pre`` (9,), CBF-QP off,
+``cri_limit=0.96``. Built by ``python -m openpi.cri.annotate_rlds_addon``.
 
 Fixed dataset locations (do not copy the 1.7T RLDS)::
 
     DROID RLDS : /media/safetics/D/droid/1.0.1
-    CRI addon  : <E>/droid_1.0.1_cri_addon
+    CRI addon  : <E>/droid_1.0.1_cri_addon_v3
     pretrained : <E>/openpi/pretrained/pi05_droid  (~12 GiB init)
 
 Training outputs::
@@ -14,36 +17,21 @@ Training outputs::
 
 ``<E>`` resolves to ``/mnt/E`` when mounted there, else legacy ``/media/safetics/E``.
 
-CRI is encoded as a separate discrete LLM span (not continuous proprio state)::
+CRI is a TacVLA-style always-on prefix stream (not language bins, no on/off gate).
+Language stays the official Pi05 form::
 
-    Task: <lang>, State: <bins>, CRI: <9 bins>;
+    Task: <lang>, State: <bins>;
     Action:
-
-This mirrors TacVLA (arXiv:2603.12665) at the training-recipe level:
-pi05_droid + LoRA + compact non-vision tokens fused in the VLM prefix.
 
 Usage (from repo root)::
 
-    # One-shot: norm stats + train
+    # TacVLA-style prefix CRI, DROID:PolaRiS = 9:1 (do not overwrite droid_cri_tacvla_lora)
     uv run --group rlds scripts/train_pi05_droid_cri.py \\
-        --exp-name=droid_cri_lora --overwrite
+        --exp-name=droid_cri_tacvla_polaris91 --overwrite --skip-norm-stats --monitor
 
-    # Or step-by-step
-    uv run --group rlds scripts/compute_norm_stats.py \\
-        --config-name pi05_droid_cri_finetune --max-frames 200000
-
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 uv run --group rlds scripts/train.py \\
-        pi05_droid_cri_finetune --exp-name=droid_cri_lora --overwrite
-
-    # Resume (checkpoints live on E: — clean tmp there if needed)
-    rm -rf /mnt/E/openpi/checkpoints/pi05_droid_cri_finetune/droid_cri_lora/*.orbax-checkpoint-tmp-*
+    # Resume
     uv run --group rlds scripts/train_pi05_droid_cri.py \\
-        --exp-name=droid_cri_lora --resume --skip-norm-stats --monitor \\
-        --batch-size=8 --rlds-shuffle-buffer-size=32000
-    # Optional: override length, e.g. --num-train-steps=50000
-
-    # After unexpected reboot:
-    .venv/bin/python scripts/diagnose_reboot.py
+        --exp-name=droid_cri_tacvla_polaris91 --resume --skip-norm-stats --monitor
 """
 
 from __future__ import annotations
@@ -51,6 +39,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -75,7 +64,7 @@ _DEFAULT_SHUFFLE_BUFFER = 32_000
 
 @dataclasses.dataclass
 class Args:
-    exp_name: str = "droid_cri_lora"
+    exp_name: str = "droid_cri_tacvla_polaris91"
     overwrite: bool = False
     resume: bool = False
     skip_norm_stats: bool = False
@@ -95,8 +84,12 @@ class Args:
     """Sample GPU/host health to data/logs/train_health_*.csv (for reboot forensics)."""
     monitor_interval_sec: float = 5.0
     """Health sampling period when --monitor is set."""
-    num_train_steps: int | None = None
-    """Override TrainConfig.num_train_steps (default: config value, currently 30k)."""
+    num_train_steps: int = 20_000
+    """Total LoRA steps (checkpoints at 10k / 20k)."""
+    save_interval: int = 10_000
+    """Write a checkpoint every N steps (and keep those steps)."""
+    keep_period: int | None = 10_000
+    """Do not delete checkpoints whose step is a multiple of this."""
 
 
 def _ensure_pretrained(*, download_if_missing: bool = True) -> None:
@@ -148,6 +141,36 @@ def _ensure_checkpoint_symlink(repo: Path) -> None:
     print(f"[ok] symlink   : {link} → {desired}")
 
 
+def _norm_stats_path(repo: Path) -> Path:
+    return repo / "data" / "assets" / CONFIG_NAME / "droid_cri" / "norm_stats.json"
+
+
+def _restore_norm_stats(repo: Path, exp_name: str) -> Path | None:
+    """Copy norm_stats.json back if ``data/assets`` was wiped (resume still needs it)."""
+    dest = _norm_stats_path(repo)
+    if dest.is_file():
+        return dest
+    candidates: list[Path] = []
+    for exp in (exp_name, "droid_cri_v3_lora", "droid_cri_lora", "droid_cri_f_lora"):
+        root = CHECKPOINT_BASE_DIR / CONFIG_NAME / exp
+        if root.is_dir():
+            candidates.extend(root.glob("*/assets/droid_cri/norm_stats.json"))
+    if not candidates:
+        return None
+
+    def _step(path: Path) -> int:
+        try:
+            return int(path.parents[2].name)
+        except ValueError:
+            return -1
+
+    src = max(candidates, key=_step)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    print(f"[ok] restored norm stats from {src}")
+    return dest
+
+
 def _require_datasets(repo: Path) -> None:
     if not DROID_RLDS_DIR.is_dir():
         raise FileNotFoundError(
@@ -167,12 +190,28 @@ def _require_datasets(repo: Path) -> None:
     if not meta_path.is_file():
         raise FileNotFoundError(f"CRI addon meta missing: {meta_path}")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if meta.get("format") != "openpi_cri_addon_v3":
+        raise ValueError(
+            f"CRI addon {CRI_ADDON_DIR} has format={meta.get('format')!r}; "
+            "expected openpi_cri_addon_v3 (delayed cri_pre, no time-scale s). "
+            "Rebuild with: uv run --group rlds python -m openpi.cri.annotate_rlds_addon"
+        )
+    if bool(meta.get("filter_enabled", True)):
+        raise ValueError(
+            f"CRI addon {CRI_ADDON_DIR} was built with filter_enabled=True. "
+            "This LoRA run expects CBF-QP off (--no-filter-enabled)."
+        )
+    cri_limit = float(meta.get("cri_limit", -1.0))
+    if abs(cri_limit - 0.96) > 1e-6:
+        raise ValueError(
+            f"CRI addon {CRI_ADDON_DIR} has cri_limit={cri_limit}; expected 0.96."
+        )
     if not meta.get("finished", False):
         raise RuntimeError(
             f"CRI addon is not marked finished: {meta_path}\n"
             f"meta={meta}"
         )
-    for name in ("cri.f32", "joint_velocity.f32", "episodes.jsonl"):
+    for name in ("cri.f32", "delta.f32", "joint_velocity.f32", "episodes.jsonl"):
         if not (CRI_ADDON_DIR / name).is_file():
             raise FileNotFoundError(f"CRI addon incomplete, missing {name} under {CRI_ADDON_DIR}")
 
@@ -184,7 +223,11 @@ def _require_datasets(repo: Path) -> None:
     _ensure_checkpoint_symlink(repo)
 
     print(f"[ok] DROID RLDS : {DROID_RLDS_DIR}")
-    print(f"[ok] CRI addon  : {CRI_ADDON_DIR} (episodes={meta.get('num_episodes')})")
+    print(
+        f"[ok] CRI addon  : {CRI_ADDON_DIR} "
+        f"(episodes={meta.get('num_episodes')}, filter_enabled={meta.get('filter_enabled')}, "
+        f"cri_limit={meta.get('cri_limit')}, obs_dim={meta.get('num_cri_obs_dim')})"
+    )
     print(f"[ok] checkpoints: {CHECKPOINT_BASE_DIR}/…")
     print("[ok] assets     : data/assets/…")
 
@@ -193,6 +236,13 @@ def main(args: Args) -> None:
     repo = Path(__file__).resolve().parent.parent
     _ensure_pretrained()
     _require_datasets(repo)
+
+    stats_path = _norm_stats_path(repo)
+    if args.skip_norm_stats and not stats_path.is_file():
+        restored = _restore_norm_stats(repo, args.exp_name)
+        if restored is None:
+            print("[1/2] --skip-norm-stats but norm stats missing; will recompute")
+            args.skip_norm_stats = False
 
     if not args.skip_norm_stats:
         print(
@@ -214,7 +264,7 @@ def main(args: Args) -> None:
             check=True,
         )
     else:
-        print("[1/2] Skipping norm stats (--skip-norm-stats)")
+        print(f"[1/2] Skipping norm stats ({stats_path})")
 
     train_cmd = [
         "uv",
@@ -231,19 +281,22 @@ def main(args: Args) -> None:
         train_cmd.append("--overwrite")
     if args.resume:
         train_cmd.append("--resume")
-    if args.num_train_steps is not None:
-        train_cmd.append(f"--num-train-steps={args.num_train_steps}")
+    train_cmd.append(f"--num-train-steps={args.num_train_steps}")
+    train_cmd.append(f"--save-interval={args.save_interval}")
+    if args.keep_period is not None:
+        train_cmd.append(f"--keep-period={args.keep_period}")
 
     print(f"[2/2] Training: {' '.join(train_cmd)}")
     print(
         f"  mem knobs: batch_size={args.batch_size}, "
         f"rlds_shuffle_buffer_size={args.rlds_shuffle_buffer_size}, "
         f"XLA_MEM_FRACTION={args.mem_fraction}, "
-        f"num_train_steps={args.num_train_steps or 'config-default'}"
+        f"num_train_steps={args.num_train_steps}, "
+        f"save_interval={args.save_interval}, keep_period={args.keep_period}"
     )
     print(
-        "  modality: vision + language/state + CRI tokens "
-        "(TacVLA-style discrete non-vision tokens, LoRA on pi05_droid)"
+        "  modality: vision + language/state + TacVLA CRI prefix "
+        "(delayed cri_pre, always on, CBF-QP off, LoRA on pi05_droid, DROID:PolaRiS=9:1)"
     )
     env = os.environ.copy()
     env.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", args.mem_fraction)

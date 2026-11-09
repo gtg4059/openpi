@@ -4,14 +4,15 @@ Sibling entry point to::
 
     uv run scripts/train.py pi05_droid_finetune --exp-name=my_experiment --overwrite
 
-CRI is encoded as a separate discrete LLM span (not continuous state)::
+CRI is a TacVLA-style always-on prefix stream (not language bins, no on/off gate).
+Language stays the official Pi05 form::
 
-    Task: <lang>, State: <bins>, CRI: <9 bins>;
+    Task: <lang>, State: <bins>;
     Action:
 
 Usage (from repo root)::
 
-    # 1) Compute norm stats (required once; proprio state only — CRI is tokenized)
+    # 1) Compute norm stats (required once; proprio state only — CRI is a prefix stream)
     uv run --group rlds scripts/compute_norm_stats.py \\
         --config-name pi05_droid_100_cri_finetune --max-frames 5000
 

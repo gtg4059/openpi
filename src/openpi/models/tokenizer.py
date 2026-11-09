@@ -32,7 +32,7 @@ class PaligemmaTokenizer:
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
             if cri is not None:
-                # CRI is clamped to [0, 2] offline; digitize independently of proprio state.
+                # Legacy language-binned CRI (unused by current CRI configs; prefix encoder is used instead).
                 cri_arr = np.asarray(cri, dtype=np.float64).reshape(-1)
                 discretized_cri = np.digitize(cri_arr, bins=np.linspace(0, 2, 256 + 1)[:-1]) - 1
                 cri_str = " ".join(map(str, discretized_cri))

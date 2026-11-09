@@ -31,6 +31,13 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # TacVLA-style CRI prefix tokens (always on, never language-binned, no contact gate).
+    use_cri_prefix: bool = False
+    num_cri_tokens: int = 9
+    # Zero `out_proj` / pos so CRI tokens start at 0 (official polaris behavior at step 0).
+    cri_encoder_zero_init: bool = False
+    # Freeze every param except `cri_encoder`.
+    train_cri_encoder_only: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -80,6 +87,7 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                cri=jax.ShapeDtypeStruct([batch_size, 9], jnp.float32) if self.use_cri_prefix else None,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -87,6 +95,8 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
+        if self.train_cri_encoder_only:
+            return nnx.Not(nnx_utils.PathRegex(".*cri_encoder.*"))
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
@@ -111,6 +121,11 @@ class Pi0Config(_model.BaseModelConfig):
             # If any lora is used, exclude all lora params.
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            )
+        if self.use_cri_prefix:
+            # Always-on CRI prefix encoder is new and must stay trainable.
+            filters.append(
+                nnx.Not(nnx_utils.PathRegex(".*cri_encoder.*")),
             )
         if not filters:
             return nnx.Nothing

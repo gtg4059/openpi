@@ -129,10 +129,24 @@ class DroidRldsDataset:
             cri_addon_reader = None
             if include_cri and dataset_cfg.cri_addon_dir is not None:
                 from openpi.cri.addon import CriAddonReader
-                from openpi.cri.constants import NUM_CRI_POINTS
+                from openpi.cri.constants import NUM_CRI_OBS_DIM
 
                 cri_addon_reader = CriAddonReader(Path(dataset_cfg.cri_addon_dir))
                 logging.info(f"Using CRI addon at {dataset_cfg.cri_addon_dir} ({len(cri_addon_reader.entries)} episodes)")
+                cri_key_table = tf.lookup.StaticHashTable(
+                    tf.lookup.KeyValueTensorInitializer(
+                        list(cri_addon_reader.entries.keys()),
+                        [True] * len(cri_addon_reader.entries),
+                    ),
+                    default_value=False,
+                )
+                dataset = dataset.filter(
+                    lambda traj: cri_key_table.lookup(
+                        traj["traj_metadata"]["episode_metadata"]["recording_folderpath"][0]
+                        + "--"
+                        + traj["traj_metadata"]["episode_metadata"]["file_path"][0]
+                    )
+                )
 
             def restructure(traj):
                 """Reformat observation and action keys, sample language instruction."""
@@ -175,7 +189,11 @@ class DroidRldsDataset:
                     + "--"
                     + indices
                 )
-                passes_filter = self.filter_table.lookup(step_id)
+                # PolaRiS RLDS stores ``/media/arhan/Secondary1/...``; the official
+                # idle-filter JSON uses ``/media/arhan/Secondary/...``. Without this
+                # rewrite every PolaRiS frame fails the filter (0% of that mix).
+                filter_step_id = tf.strings.regex_replace(step_id, "/Secondary1/", "/Secondary/")
+                passes_filter = self.filter_table.lookup(filter_step_id)
 
                 observation = {
                     "image": exterior_img,
@@ -195,7 +213,7 @@ class DroidRldsDataset:
                             key = _episode_key(rec.numpy(), fp.numpy())
                             if key not in cri_addon_reader:
                                 raise KeyError(f"CRI addon missing episode key: {key}")
-                            cri_np = cri_addon_reader.get_cri(key)
+                            cri_np = cri_addon_reader.get_cri_obs(key)
                             length_i = int(length.numpy())
                             if cri_np.shape[0] < length_i:
                                 raise ValueError(
@@ -204,7 +222,7 @@ class DroidRldsDataset:
                             return cri_np[:length_i]
 
                         cri = tf.py_function(_lookup_cri, [rec0, fp0, traj_len], Tout=tf.float32)
-                        cri.set_shape([None, NUM_CRI_POINTS])
+                        cri.set_shape([None, NUM_CRI_OBS_DIM])
                         observation["cri"] = cri
                     else:
                         observation["cri"] = traj["observation"]["cri"]
@@ -257,18 +275,9 @@ class DroidRldsDataset:
                 return frame
 
             dataset = dataset.map(remove_passes_filter)
-
-            # Decode images: RLDS saves encoded images, only decode now for efficiency
-            def decode_images(traj):
-                traj["observation"]["image"] = tf.io.decode_image(
-                    traj["observation"]["image"], expand_animations=False, dtype=tf.uint8
-                )
-                traj["observation"]["wrist_image"] = tf.io.decode_image(
-                    traj["observation"]["wrist_image"], expand_animations=False, dtype=tf.uint8
-                )
-                return traj
-
-            return dataset.frame_map(decode_images, num_parallel_calls)
+            # Keep JPEG bytes through mix/shuffle. Decoding 32k RGB frames before
+            # shuffle is what made the first-batch wait ~50 minutes.
+            return dataset
 
         logging.info(f"Preparing {len(datasets)} datasets...")
         logging.info("-" * 50)
@@ -281,10 +290,21 @@ class DroidRldsDataset:
         weights = [dataset.weight for dataset in datasets]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
-        # Skip shuffle for norm-stats / deterministic passes — a 250k frame buffer of
-        # decoded images routinely OOMs host RAM (exit 137) on single-workstation machines.
+        # Shuffle encoded JPEGs (small). A 250k *decoded* buffer OOMs host RAM.
         if shuffle:
+            logging.info("Filling RLDS shuffle buffer (%d encoded frames)...", shuffle_buffer_size)
             final_dataset = final_dataset.shuffle(shuffle_buffer_size)
+
+        def decode_images(traj):
+            traj["observation"]["image"] = tf.io.decode_image(
+                traj["observation"]["image"], expand_animations=False, dtype=tf.uint8
+            )
+            traj["observation"]["wrist_image"] = tf.io.decode_image(
+                traj["observation"]["wrist_image"], expand_animations=False, dtype=tf.uint8
+            )
+            return traj
+
+        final_dataset = final_dataset.frame_map(decode_images, num_parallel_calls)
         final_dataset = final_dataset.batch(batch_size)
         # Note =>> Seems to reduce memory usage without affecting speed?
         final_dataset = final_dataset.with_ram_budget(1)

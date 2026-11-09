@@ -16,12 +16,15 @@ from openpi.cri.constants import NUM_CRI_POINTS
 class _FakeSolver:
     batch_size = 4
 
-    def compute(self, q: Any, qd: Any, *, return_torch: bool = False) -> np.ndarray:
-        del return_torch, qd
+    def run_cri_filter(self, q: Any, qd: Any) -> dict[str, Any]:
         batch = np.asarray(q).reshape(-1, np.asarray(q).shape[-1]).shape[0]
-        # Encode mean |qd| into first channel via side effect from compute_cri filter path:
-        # return ones; zero-vel filter in compute_cri will zero at-rest rows.
-        return np.ones((batch, NUM_CRI_POINTS), dtype=np.float32)
+        # Constant ones; compute_episode_cri_f delays so t=0 is 0 and later ticks
+        # read the previous solve (IsaacLab CRI-F).
+        return {
+            "cri_pre": np.ones((batch, NUM_CRI_POINTS), dtype=np.float32),
+            "qd_cmd": np.asarray(qd, dtype=np.float32).reshape(batch, -1),
+            "delta": np.zeros((batch,), dtype=np.float32),
+        }
 
 
 def test_compute_episode_cri_first_step_zero():
@@ -32,6 +35,8 @@ def test_compute_episode_cri_first_step_zero():
     assert cri.shape == (5, NUM_CRI_POINTS)
     np.testing.assert_allclose(qd[0], 0.0)
     np.testing.assert_allclose(cri[0], 0.0)
+    # 1-step delay: t=1 reads the t=0 solve (ones). Remaining ticks stay positive.
+    np.testing.assert_allclose(cri[1], 1.0)
     assert np.all(cri[1:] > 0)
 
 

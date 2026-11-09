@@ -98,6 +98,30 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.use_cri_prefix = config.use_cri_prefix
+        self.num_cri_tokens = config.num_cri_tokens
+        self.cri_encoder = None
+        if config.use_cri_prefix:
+            # TacVLA-style compact MLP tokens. Always on (no contact/risk gate).
+            width = paligemma_config.width
+            if config.cri_encoder_zero_init:
+                self.cri_encoder = nnx.Dict(
+                    in_proj=nnx.Linear(9, 256, rngs=rngs),
+                    out_proj=nnx.Linear(
+                        256,
+                        config.num_cri_tokens * width,
+                        kernel_init=nnx.initializers.zeros,
+                        bias_init=nnx.initializers.zeros,
+                        rngs=rngs,
+                    ),
+                    pos=nnx.Param(jnp.zeros((config.num_cri_tokens, width))),
+                )
+            else:
+                self.cri_encoder = nnx.Dict(
+                    in_proj=nnx.Linear(9, 256, rngs=rngs),
+                    out_proj=nnx.Linear(256, config.num_cri_tokens * width, rngs=rngs),
+                    pos=nnx.Param(jax.random.normal(rngs.params(), (config.num_cri_tokens, width)) * 0.02),
+                )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -131,6 +155,21 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        if self.use_cri_prefix:
+            if obs.cri is None:
+                raise ValueError("use_cri_prefix=True but observation.cri is missing")
+            if self.cri_encoder is None:
+                raise ValueError("CRI prefix encoder is not initialized")
+            batch = obs.state.shape[0]
+            cri = jnp.clip(obs.cri.astype(jnp.float32).reshape(batch, 9), 0.0, 2.0)
+            hidden = nnx.swish(self.cri_encoder.in_proj(cri))
+            cri_tokens = self.cri_encoder.out_proj(hidden)
+            cri_tokens = cri_tokens.reshape(batch, self.num_cri_tokens, -1)
+            cri_tokens = cri_tokens + self.cri_encoder.pos.value.astype(cri_tokens.dtype)
+            tokens.append(cri_tokens)
+            input_mask.append(jnp.ones((cri.shape[0], self.num_cri_tokens), dtype=jnp.bool_))
+            # Always-on prefix tokens: bidirectional with images/language.
+            ar_mask += [False] * self.num_cri_tokens
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)

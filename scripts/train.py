@@ -223,6 +223,10 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
+    logging.info(
+        "Fetching first RLDS batch (fills the shuffle buffer; encoded JPEGs, then decode). "
+        "This is the long silent wait — not a hang."
+    )
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 

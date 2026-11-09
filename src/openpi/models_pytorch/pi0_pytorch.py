@@ -108,6 +108,18 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        self.use_cri_prefix = getattr(config, "use_cri_prefix", False)
+        self.num_cri_tokens = getattr(config, "num_cri_tokens", 9)
+        if self.use_cri_prefix:
+            width = paligemma_config.width
+            self.cri_in_proj = nn.Linear(9, 256)
+            self.cri_out_proj = nn.Linear(256, self.num_cri_tokens * width)
+            self.cri_pos = nn.Parameter(torch.randn(self.num_cri_tokens, width) * 0.02)
+            if getattr(config, "cri_encoder_zero_init", False):
+                nn.init.zeros_(self.cri_out_proj.weight)
+                nn.init.zeros_(self.cri_out_proj.bias)
+                nn.init.zeros_(self.cri_pos)
+
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
@@ -168,6 +180,7 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            getattr(observation, "cri", None),
         )
 
     def sample_noise(self, shape, device):
@@ -185,7 +198,7 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, cri=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -224,6 +237,17 @@ class PI0Pytorch(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if self.use_cri_prefix:
+            if cri is None:
+                raise ValueError("use_cri_prefix=True but observation.cri is missing")
+            cri = torch.clamp(cri.to(dtype=torch.float32).reshape(cri.shape[0], -1), 0.0, 2.0)
+            hidden = F.silu(self.cri_in_proj(cri))
+            cri_tokens = self.cri_out_proj(hidden).reshape(cri.shape[0], self.num_cri_tokens, -1)
+            cri_tokens = cri_tokens + self.cri_pos.to(dtype=cri_tokens.dtype)
+            embs.append(cri_tokens)
+            pad_masks.append(torch.ones(cri.shape[0], self.num_cri_tokens, dtype=torch.bool, device=cri.device))
+            att_masks += [0] * self.num_cri_tokens
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -316,7 +340,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, cri = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -328,7 +352,9 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, cri
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -381,9 +407,11 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, cri = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, cri
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

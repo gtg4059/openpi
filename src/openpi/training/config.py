@@ -25,12 +25,13 @@ def _resolve_existing_dir(*candidates: str) -> pathlib.Path:
 # E: may be mounted at /mnt/E (current) or legacy /media/safetics/E.
 _DROID_RLDS_DIR = pathlib.Path("/media/safetics/D/droid/1.0.1")
 _E_ROOT = _resolve_existing_dir("/mnt/E", "/media/safetics/E")
-_CRI_ADDON_DIR = _E_ROOT / "droid_1.0.1_cri_addon"
+_CRI_ADDON_DIR = _E_ROOT / "droid_1.0.1_cri_addon_v3"
 _TRAIN_OUTPUT_DIR = _REPO_ROOT / "data"
 # Large Orbax checkpoints (~9–11 GiB each) go to E: to avoid filling root (/).
 _CHECKPOINT_OUTPUT_DIR = _E_ROOT / "openpi" / "checkpoints"
 # Pretrained init weights on E: (avoid downloading ~12 GiB into ~/.cache on start).
 _PRETRAINED_PI05_DROID_PARAMS = _E_ROOT / "openpi" / "pretrained" / "pi05_droid" / "params"
+_PRETRAINED_PI05_BASE_PARAMS = _E_ROOT / "openpi" / "pretrained" / "pi05_base" / "params"
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -120,7 +121,7 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
-    # Append observation/cri to proprioceptive state (DROID+CRI RLDS).
+    # Join observation/cri and feed it as always-on TacVLA-style prefix tokens.
     include_cri: bool = False
     # Optional CRI sidecar directory (see ``openpi.cri.annotate_rlds_addon``).
     cri_addon_dir: str | None = None
@@ -443,23 +444,25 @@ class RLDSDroidDataConfig(DataConfigFactory):
             )
 
         if self.include_cri:
-            # CRI is encoded as a separate discrete token span (``CRI: ...``), not continuous state.
             if not isinstance(model_config, pi0_config.Pi0Config) or not model_config.pi05:
                 raise ValueError("include_cri currently requires a Pi05 model config")
-            # Extra room for ``, CRI: <9 bins>`` in the language prefix.
-            token_len = max(model_config.max_token_len, 220)
-            model_transforms = _transforms.Group(
-                inputs=[
-                    _transforms.InjectDefaultPrompt(None),
-                    _transforms.ResizeImages(224, 224),
-                    _transforms.TokenizePrompt(
-                        _tokenizer.PaligemmaTokenizer(token_len),
-                        discrete_state_input=model_config.discrete_state_input,
-                        discrete_cri_input=True,
-                    ),
-                    _transforms.PadStatesAndActions(model_config.action_dim),
-                ],
-            )
+            if model_config.use_cri_prefix:
+                model_transforms = ModelTransformFactory()(model_config)
+            else:
+                # Language-binned CRI (droid_cri_v3_lora): ``Task: ..., State: ..., CRI: <9 bins>;``
+                token_len = max(int(model_config.max_token_len), 220)
+                model_transforms = _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(None),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                            discrete_cri_input=True,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
         else:
             model_transforms = ModelTransformFactory()(model_config)
 
@@ -468,7 +471,8 @@ class RLDSDroidDataConfig(DataConfigFactory):
         datasets = self.datasets
         if self.cri_addon_dir is not None:
             datasets = tuple(
-                dataclasses.replace(ds, cri_addon_dir=self.cri_addon_dir) for ds in datasets
+                dataclasses.replace(ds, cri_addon_dir=ds.cri_addon_dir or self.cri_addon_dir)
+                for ds in datasets
             )
 
         return dataclasses.replace(
@@ -601,7 +605,7 @@ class TrainConfig:
     # Example:
     #   --rlds-builder-dir=/media/safetics/D/droid_100/1.0.0_CRI
     #   --rlds-data-dir=/media/safetics/D
-    #   --cri-addon-dir=/home/safetics/openpi/data/droid_1.0.1_cri_addon
+    #   --cri-addon-dir=/mnt/E/droid_1.0.1_cri_addon_v3
     rlds_data_dir: str | None = None
     rlds_builder_dir: str | None = None
     cri_addon_dir: str | None = None
@@ -931,9 +935,10 @@ _CONFIGS = [
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
     TrainConfig(
-        # This config is for fine-tuning pi05 on the *full* DROID dataset.
-        # We use RLDS data loading to make training on this large dataset tractable.
-        # For fine-tuning on your own DROID dataset, see below.
+        # Full-weight fine-tune of pi05_base on local DROID 1.0.1 (no LoRA, no CRI).
+        # Official recipe is 100k steps / bs256 on 8x H100. This host is 1x RTX PRO 6000
+        # (~96GiB): bs4 + shuffle 32k. Outputs live on E: (checkpoints + assets).
+        # Run via: ``uv run --group rlds scripts/train_pi05_full_droid.py --exp-name=droid_full --overwrite``
         name="pi05_full_droid_finetune",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -942,15 +947,24 @@ _CONFIGS = [
         ),
         data=RLDSDroidDataConfig(
             repo_id="droid",
-            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/mnt/pi-data/kevin",
+            rlds_data_dir=str(_DROID_RLDS_DIR.parent.parent),  # /media/safetics/D
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            rlds_shuffle_buffer_size=32_000,
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    name="droid",
+                    version="1.0.1",
+                    weight=1.0,
+                    filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
+                    builder_dir=str(_DROID_RLDS_DIR),
+                ),
+            ),
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PRETRAINED_PI05_BASE_PARAMS)),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -958,11 +972,14 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         num_train_steps=100_000,
-        batch_size=256,
+        # Full FT + EMA is heavier than LoRA (bs8). bs4 leaves headroom on 96GiB.
+        batch_size=4,
         log_interval=100,
         save_interval=5000,
         keep_period=10_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+        checkpoint_base_dir=str(_CHECKPOINT_OUTPUT_DIR),
+        assets_base_dir=str(_E_ROOT / "openpi" / "assets"),
     ),
     TrainConfig(
         # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
@@ -989,21 +1006,19 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
-        # Full DROID 1.0.1 (D:) + CRI sidecar (E:), TacVLA-style discrete safety tokens.
-        # CRI is not continuous state; language prefix is:
-        #   Task: ..., State: ..., CRI: <9 bins>;
-        #   Action:
-        # Analogous to TacVLA (arXiv:2603.12665): pi05_droid + LoRA + compact non-vision modality tokens.
+        # TacVLA-style always-on CRI prefix (no language bins, no contact gate).
+        # Data mix matches official PolaRiS: 90% DROID + 10% polaris_droid_cotrain, both with CRI.
+        # Init remains pi05_droid. Language stays Task/State only.
         # Outputs:
         #   checkpoints → <E>/openpi/checkpoints/pi05_droid_cri_finetune/<exp_name>
         #   norm stats  → data/assets/pi05_droid_cri_finetune/droid_cri
-        # Run via: ``uv run --group rlds scripts/train_pi05_droid_cri.py --exp-name=my_experiment --overwrite``
+        # Run via: ``uv run --group rlds scripts/train_pi05_droid_cri.py --exp-name=droid_cri_tacvla_polaris91 --overwrite --skip-norm-stats``
         name="pi05_droid_cri_finetune",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
             action_horizon=16,
-            max_token_len=220,
+            use_cri_prefix=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
@@ -1015,6 +1030,64 @@ _CONFIGS = [
             cri_addon_dir=str(_CRI_ADDON_DIR),
             # Host RAM ~125GiB; default 250k image shuffle OOM-killed python (~121GiB RSS).
             # 50k ran to step 2000; 32k leaves headroom for Orbax save + monitor.
+            rlds_shuffle_buffer_size=32_000,
+            datasets=(
+                polaris_config._local_droid_dataset(weight=0.9, cri=True),
+                polaris_config._local_polaris_dataset(weight=0.1, cri=True),
+            ),
+            assets=AssetsConfig(
+                asset_id="droid_cri",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PRETRAINED_PI05_DROID_PARAMS)),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-5,
+        ),
+        # LoRA 20k; Orbax checkpoint every 10k (keep_period=10k).
+        num_train_steps=20_000,
+        # Single RTX PRO 6000 (~96GiB): bs16 OOM at restore; bs8 stable.
+        batch_size=8,
+        log_interval=100,
+        save_interval=10_000,
+        keep_period=10_000,
+        num_workers=0,  # RLDS loader manages its own parallelism
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            use_cri_prefix=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # recommended for LoRA
+        # Checkpoints on E: (large); norm-stats assets stay on repo data/.
+        checkpoint_base_dir=str(_CHECKPOINT_OUTPUT_DIR),
+        assets_base_dir=str(_TRAIN_OUTPUT_DIR / "assets"),
+        # Requires wandb>=0.22.3 for new-format ``wandb_v1_`` API keys.
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        # Serve / eval config for ``droid_cri_v3_lora`` (language-binned CRI, no cri_encoder).
+        # Matches the 50k checkpoint trained before the TacVLA-style prefix change.
+        name="pi05_droid_cri_finetune_lang",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            max_token_len=220,
+            use_cri_prefix=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RLDSDroidDataConfig(
+            repo_id="droid_cri",
+            rlds_data_dir=str(_DROID_RLDS_DIR.parent.parent),
+            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            include_cri=True,
+            cri_addon_dir=str(_CRI_ADDON_DIR),
             rlds_shuffle_buffer_size=32_000,
             datasets=(
                 droid_rlds_dataset.RLDSDataset(
@@ -1030,35 +1103,10 @@ _CONFIGS = [
                 asset_id="droid_cri",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PRETRAINED_PI05_DROID_PARAMS)),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=5e-5,
-        ),
-        # TacVLA used 10k; we run longer LoRA finetune (resume from 10k checkpoint OK).
-        num_train_steps=30_000,
-        # Single RTX PRO 6000 (~96GiB): bs16 OOM at restore; bs8 stable.
-        batch_size=8,
-        log_interval=100,
-        save_interval=1_000,
-        keep_period=2_000,
-        num_workers=0,  # RLDS loader manages its own parallelism
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            max_token_len=220,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,  # recommended for LoRA
-        # Checkpoints on E: (large); norm-stats assets stay on repo data/.
         checkpoint_base_dir=str(_CHECKPOINT_OUTPUT_DIR),
         assets_base_dir=str(_TRAIN_OUTPUT_DIR / "assets"),
-        # Requires wandb>=0.22.3 for new-format ``wandb_v1_`` API keys.
-        wandb_enabled=True,
+        wandb_enabled=False,
+        ema_decay=None,
     ),
     TrainConfig(
         # Debug / smoke fine-tune of pi05_base on CRI-annotated droid_100 RLDS.
@@ -1071,14 +1119,14 @@ _CONFIGS = [
             pi05=True,
             action_dim=32,
             action_horizon=16,
-            max_token_len=220,  # room for separate ``CRI: ...`` token span
+            use_cri_prefix=True,
         ),
         data=RLDSDroidDataConfig(
             repo_id="droid_100_cri",
             # Parent of dataset name dirs; unused when builder_dir is set, but required by assert.
             rlds_data_dir=str(_REPO_ROOT / "data"),
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
-            include_cri=True,  # LLM tokens: ``Task: ..., State: ..., CRI: ...;``
+            include_cri=True,  # always-on CRI prefix tokens (not language bins)
             rlds_shuffle_buffer_size=2_000,
             datasets=(
                 droid_rlds_dataset.RLDSDataset(

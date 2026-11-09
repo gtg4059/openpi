@@ -103,7 +103,7 @@ def main(
 
         --rlds-builder-dir=/media/safetics/D/droid_100/1.0.0_CRI
         --rlds-data-dir=/media/safetics/D
-        --cri-addon-dir=/mnt/E/droid_1.0.1_cri_addon
+        --cri-addon-dir=/mnt/E/droid_1.0.1_cri_addon_v3
     """
     config = _config.get_config(config_name)
     config = _config.apply_rlds_path_overrides(

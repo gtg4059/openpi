@@ -271,8 +271,9 @@ class TokenizePrompt(DataTransformFn):
             prompt = prompt.item()
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state, cri=cri)
-        # Drop cri so it is not forwarded into model Observation.
-        out = {k: v for k, v in data.items() if k != "cri"}
+        # Language-binned CRI is consumed here. TacVLA-style prefix CRI stays on `cri`
+        # and is encoded by the model (always on, not gated).
+        out = data if not self.discrete_cri_input else {k: v for k, v in data.items() if k != "cri"}
         return {**out, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

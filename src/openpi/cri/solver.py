@@ -6,13 +6,18 @@ import logging
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 import numpy as np
 import torch
 
+from openpi.cri.constants import CBF_ALPHA
+from openpi.cri.constants import CRI_FILTER_LIMIT
 from openpi.cri.constants import DEFAULT_NUM_JOINTS
 from openpi.cri.constants import DEFAULT_ZERO_VEL_EPS
 from openpi.cri.constants import NUM_CRI_POINTS
+from openpi.cri.cri_realtime_monitor import configure_cri_filter
+from openpi.cri.filter import command_delta
 from openpi.cri.postprocess import apply_cri_zero_vel_filter
 from openpi.cri.postprocess import clamp_cri
 
@@ -54,10 +59,19 @@ def resolve_analysis_dir(analysis_dir: str | Path | None = None) -> Path:
     return root
 
 
+def _resolve_bundled_lib_dir(analysis_dir: Path) -> Path:
+    """Prefer ``lib/<major.minor>/`` (IsaacLab ``configure_cudacri``), else flat ``lib/``."""
+    root = analysis_dir / "lib"
+    versioned = root / f"{sys.version_info.major}.{sys.version_info.minor}"
+    if versioned.is_dir():
+        return versioned
+    return root
+
+
 def _bootstrap_sfd_coreservice(analysis_dir: Path):
     """Import ``sfd_coreservice`` without pulling IsaacLab / Omniverse packages."""
-    lib_dir = analysis_dir / "lib"
-    for path in (analysis_dir, lib_dir):
+    lib_dir = _resolve_bundled_lib_dir(analysis_dir)
+    for path in (analysis_dir, lib_dir, analysis_dir / "lib"):
         path_str = str(path)
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
@@ -114,6 +128,10 @@ class CriSolver:
         num_joints: int = DEFAULT_NUM_JOINTS,
         zero_vel_eps: float = DEFAULT_ZERO_VEL_EPS,
         warmup_rounds: int | None = None,
+        cri_filter: bool = False,
+        cri_limit: float = CRI_FILTER_LIMIT,
+        cbf_alpha: float = CBF_ALPHA,
+        filter_enabled: bool = True,
     ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CriSolver requires CUDA (sfd_coreservice GPU path).")
@@ -125,10 +143,27 @@ class CriSolver:
         self.num_joints = int(num_joints)
         self.zero_vel_eps = float(zero_vel_eps)
         self.num_cri_points = NUM_CRI_POINTS
+        self._cri_limit = float(cri_limit) if cri_limit > 0.0 else CRI_FILTER_LIMIT
+        self._cbf_alpha = float(cbf_alpha) if cbf_alpha > 0.0 else CBF_ALPHA
+        self._filter_enabled = bool(filter_enabled)
+        self._approach_limit = self._cri_limit * (1.0 - self._cbf_alpha)
 
         sfd = _bootstrap_sfd_coreservice(self.analysis_dir)
         self._solver = sfd.CoreService(str(self.analysis_dir), self.batch_size)
         self._solver.RunSolver_CUDA_LoadAnalysisForCRI(str(self.analysis_dir))
+
+        if cri_filter:
+            self._require_cri_filter_api()
+            cfg = configure_cri_filter(
+                self._solver,
+                cri_limit=self._cri_limit,
+                alpha=self._cbf_alpha,
+                enabled=self._filter_enabled,
+            )
+            self._cri_limit = float(cfg["cri_limit"])
+            self._cbf_alpha = float(cfg["cbf_alpha"])
+            self._approach_limit = float(cfg["approach_limit"])
+            self._filter_enabled = bool(cfg["enabled"])
 
         rounds = (
             int(os.environ.get("SFD_ALLOC_WARMUP_ROUNDS", "15"))
@@ -139,9 +174,102 @@ class CriSolver:
             q0 = torch.zeros(self.batch_size, self.num_joints, dtype=torch.float64, device=self.device)
             qd0 = torch.zeros_like(q0)
             for _ in range(rounds):
-                self._solver.RunSolver_CUDA_CRI_AtMotionState(q0.contiguous(), qd0.contiguous())
+                if cri_filter:
+                    self._solver.run_cri_filter(q0.contiguous(), qd0.contiguous())
+                else:
+                    self._solver.RunSolver_CUDA_CRI_AtMotionState(q0.contiguous(), qd0.contiguous())
             torch.cuda.synchronize(self.device)
-            logger.info("CRI solver warm-up complete: %d rounds (%s)", rounds, self.analysis_dir)
+            logger.info(
+                "CRI solver warm-up complete: %d rounds filter=%s (%s)",
+                rounds,
+                cri_filter,
+                self.analysis_dir,
+            )
+
+    def _require_cri_filter_api(self) -> None:
+        if not hasattr(self._solver, "run_cri_filter"):
+            raise RuntimeError(
+                "sfd_coreservice.CoreService.run_cri_filter is missing. "
+                "Deploy a CoreService build that exports the CRI filter API."
+            )
+
+    def set_cri_filter_limit(self, cri_limit: float) -> None:
+        """IsaacLab ``set_cri_filter_limit``."""
+        self._require_cri_filter_api()
+        self._cri_limit = float(cri_limit) if cri_limit > 0.0 else CRI_FILTER_LIMIT
+        if hasattr(self._solver, "set_cri_filter_limit"):
+            self._solver.set_cri_filter_limit(self._cri_limit)
+
+    def set_cbf_alpha(self, alpha: float) -> None:
+        """IsaacLab ``set_cbf_alpha``."""
+        self._require_cri_filter_api()
+        self._cbf_alpha = float(alpha) if alpha > 0.0 else CBF_ALPHA
+        if hasattr(self._solver, "set_cbf_alpha"):
+            self._solver.set_cbf_alpha(self._cbf_alpha)
+        elif hasattr(self._solver, "RunSolver_CUDA_SetCbfAlpha"):
+            self._solver.RunSolver_CUDA_SetCbfAlpha(self._cbf_alpha)
+
+    def set_cri_filter_enabled(self, enabled: bool) -> None:
+        """IsaacLab ``set_cri_filter_enabled`` (CBF-QP on/off)."""
+        self._require_cri_filter_api()
+        self._filter_enabled = bool(enabled)
+        if hasattr(self._solver, "set_cri_filter_enabled"):
+            self._solver.set_cri_filter_enabled(self._filter_enabled)
+
+    def _pad_batch(
+        self, q: np.ndarray | torch.Tensor, qd: np.ndarray | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        q_t = _as_batch_f64(q, name="q", device=self.device)
+        qd_t = _as_batch_f64(qd, name="qd", device=self.device)
+        if q_t.shape != qd_t.shape:
+            raise ValueError(f"q and qd shape mismatch: {tuple(q_t.shape)} vs {tuple(qd_t.shape)}")
+        batch, joints = q_t.shape
+        if batch > self.batch_size:
+            raise ValueError(
+                f"batch {batch} exceeds solver batch_size={self.batch_size}; "
+                "construct CriSolver(batch_size=...) with a larger batch."
+            )
+        if joints < self.num_joints:
+            raise ValueError(f"expected at least {self.num_joints} joints, got {joints}")
+        if batch < self.batch_size:
+            q_in = torch.zeros(self.batch_size, joints, dtype=torch.float64, device=self.device)
+            qd_in = torch.zeros_like(q_in)
+            q_in[:batch] = q_t
+            qd_in[:batch] = qd_t
+        else:
+            q_in = q_t
+            qd_in = qd_t
+        return q_in, qd_in, batch
+
+    def _fit_cri_width(self, cri: torch.Tensor, batch: int) -> torch.Tensor:
+        cri = cri[:batch]
+        if cri.shape[-1] == self.num_cri_points:
+            return cri
+        if cri.shape[-1] > self.num_cri_points:
+            head = cri[..., : self.num_cri_points]
+            if torch.max(torch.abs(head)) < 1e-12:
+                return cri[..., -self.num_cri_points :]
+            return head
+        pad = torch.zeros(batch, self.num_cri_points - cri.shape[-1], device=cri.device, dtype=cri.dtype)
+        return torch.cat([cri, pad], dim=-1)
+
+    def _as_cpu_f32(self, value: Any, batch: int) -> np.ndarray | None:
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            arr = np.asarray(value)
+        elif isinstance(value, torch.Tensor):
+            arr = value.detach().cpu().numpy()
+        else:
+            try:
+                arr = np.asarray(value)
+            except (TypeError, ValueError):
+                return None
+        if arr.size == 0:
+            return None
+        if arr.ndim == 0:
+            return arr
+        return arr[:batch]
 
     def compute(
         self,
@@ -160,51 +288,100 @@ class CriSolver:
         Returns:
             CRI array of shape ``(B, NUM_CRI_POINTS)``.
         """
-        q_t = _as_batch_f64(q, name="q", device=self.device)
-        qd_t = _as_batch_f64(qd, name="qd", device=self.device)
-        if q_t.shape != qd_t.shape:
-            raise ValueError(f"q and qd shape mismatch: {tuple(q_t.shape)} vs {tuple(qd_t.shape)}")
-        batch, joints = q_t.shape
-        if batch > self.batch_size:
-            raise ValueError(
-                f"batch {batch} exceeds solver batch_size={self.batch_size}; "
-                "construct CriSolver(batch_size=...) with a larger batch."
-            )
-        if joints < self.num_joints:
-            raise ValueError(f"expected at least {self.num_joints} joints, got {joints}")
-
-        # Solver is fixed-batch; pad unused rows with zeros.
-        if batch < self.batch_size:
-            q_in = torch.zeros(self.batch_size, joints, dtype=torch.float64, device=self.device)
-            qd_in = torch.zeros_like(q_in)
-            q_in[:batch] = q_t
-            qd_in[:batch] = qd_t
-        else:
-            q_in = q_t
-            qd_in = qd_t
+        q_in, qd_in, batch = self._pad_batch(q, qd)
+        qd_t = qd_in[:batch]
 
         cri_gpu = self._solver.RunSolver_CUDA_CRI_AtMotionState(q_in.contiguous(), qd_in.contiguous())
         torch.cuda.synchronize(self.device)
         if cri_gpu is None:
             raise RuntimeError("CRI solver returned None")
 
-        cri = cri_gpu[:batch]
-        if cri.shape[-1] != self.num_cri_points:
-            # Engine may return (B, 9) = 8 colli-points + aggregate. Prefer keeping the
-            # trailing aggregate when truncating would drop the only nonzero channel.
-            if cri.shape[-1] > self.num_cri_points:
-                head = cri[..., : self.num_cri_points]
-                if torch.max(torch.abs(head)) < 1e-12:
-                    cri = cri[..., -self.num_cri_points :]
-                else:
-                    cri = head
-            else:
-                pad = torch.zeros(batch, self.num_cri_points - cri.shape[-1], device=cri.device, dtype=cri.dtype)
-                cri = torch.cat([cri, pad], dim=-1)
-
+        cri = self._fit_cri_width(cri_gpu, batch)
         cri = clamp_cri(cri.float())
         cri = apply_cri_zero_vel_filter(cri, qd_t, eps=self.zero_vel_eps)
 
         if return_torch:
             return cri
         return cri.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    def run_cri_filter(
+        self,
+        q: np.ndarray | torch.Tensor,
+        qd: np.ndarray | torch.Tensor,
+    ) -> dict[str, Any]:
+        """One IsaacLab ``run_cri_filter(q, qd_RL)`` call for a batch.
+
+        Returns numpy ``cri_pre`` ``(B, NUM_CRI_POINTS)``, ``qd_cmd``, ``delta``,
+        ``cri_limit``, ``cbf_alpha``, ``approach_limit``, and ``enabled``.
+        """
+        self._require_cri_filter_api()
+        q_in, qd_in, batch = self._pad_batch(q, qd)
+        try:
+            result = self._solver.run_cri_filter(q_in.contiguous(), qd_in.contiguous())
+            torch.cuda.synchronize(self.device)
+        except Exception as exc:
+            logger.warning("run_cri_filter native call failed; passthrough qd_RL. %s", exc)
+            qd_rl = qd_in[:batch].detach().cpu().numpy().astype(np.float32, copy=False)
+            return {
+                "cri_pre": np.zeros((batch, self.num_cri_points), dtype=np.float32),
+                "qd_cmd": qd_rl,
+                "delta": np.zeros((batch,), dtype=np.float32),
+                "cri_limit": self._cri_limit,
+                "cbf_alpha": self._cbf_alpha,
+                "approach_limit": self._approach_limit,
+                "enabled": self._filter_enabled,
+            }
+        if result is None:
+            raise RuntimeError("run_cri_filter returned None")
+        cri_pre = result.get("cri_pre") if isinstance(result, dict) else None
+        if cri_pre is None:
+            logger.warning("run_cri_filter returned empty cri_pre; passthrough qd_RL")
+            qd_rl = qd_in[:batch].detach().cpu().numpy().astype(np.float32, copy=False)
+            return {
+                "cri_pre": np.zeros((batch, self.num_cri_points), dtype=np.float32),
+                "qd_cmd": qd_rl,
+                "delta": np.zeros((batch,), dtype=np.float32),
+                "cri_limit": self._cri_limit,
+                "cbf_alpha": self._cbf_alpha,
+                "approach_limit": self._approach_limit,
+                "enabled": self._filter_enabled,
+            }
+        if isinstance(cri_pre, np.ndarray):
+            cri_t = torch.from_numpy(np.asarray(cri_pre)).to(device=self.device)
+        else:
+            cri_t = cri_pre
+        cri_t = self._fit_cri_width(cri_t, batch)
+        cri_np = clamp_cri(cri_t.float()).detach().cpu().numpy().astype(np.float32, copy=False)
+
+        def _as_float(key: str, default: float) -> float:
+            value = result.get(key, default)
+            if isinstance(value, torch.Tensor):
+                return float(value.detach().cpu().reshape(-1)[0].item())
+            return float(value)
+
+        enabled = result.get("enabled", self._filter_enabled)
+        if isinstance(enabled, torch.Tensor):
+            enabled = bool(enabled.detach().cpu().reshape(-1)[0].item())
+        else:
+            enabled = bool(enabled)
+
+        qd_rl = qd_in[:batch].detach().cpu().numpy().astype(np.float32, copy=False)
+        qd_cmd = self._as_cpu_f32(result.get("qd_cmd"), batch)
+        if qd_cmd is None or np.asarray(qd_cmd).size == 0:
+            qd_cmd = qd_rl
+        else:
+            qd_cmd = np.asarray(qd_cmd, dtype=np.float32)
+            if qd_cmd.ndim == 1:
+                qd_cmd = qd_cmd[None, :]
+            qd_cmd = qd_cmd[:batch]
+        delta = command_delta(qd_cmd, qd_rl)
+
+        return {
+            "cri_pre": cri_np,
+            "qd_cmd": qd_cmd,
+            "delta": delta,
+            "cri_limit": _as_float("cri_limit", self._cri_limit),
+            "cbf_alpha": _as_float("cbf_alpha", self._cbf_alpha),
+            "approach_limit": _as_float("approach_limit", self._approach_limit),
+            "enabled": enabled,
+        }

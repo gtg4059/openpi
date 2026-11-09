@@ -29,29 +29,40 @@ You will need 1.8TB of disk storage to download the DROID RLDS dataset.
 
 ## Run
 
-First, change the `rlds_data_dir` path in your `TrainConfig` to the directory that you downloaded the `droid` dataset into (see [src/openpi/training/config.py](src/openpi/training/config.py)).
+This workspace points `pi05_full_droid_finetune` at local DROID 1.0.1 and writes
+outputs to E: (`/mnt/E/openpi/checkpoints/...`). Official 8x H100 recipe is
+bs256; the helper uses bs4 / shuffle 32k on one RTX PRO 6000. Official
+`pi05_base` DROID norm stats are reused (no 10M-frame recompute).
 
-Then, compute normalization statistics (this will take ~10 minutes):
 ```bash
-uv run --group rlds scripts/compute_norm_stats.py --config-name pi05_full_droid_finetune --max-frames 10_000_000
+uv run --group rlds scripts/train_pi05_full_droid.py \
+  --exp-name=droid_full --overwrite --monitor
 ```
 
-Run training:
+Or step-by-step:
+
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --group rlds scripts/train.py pi05_full_droid_finetune --exp-name=my_experiment --overwrite
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 uv run --group rlds scripts/train.py \
+  pi05_full_droid_finetune --exp-name=droid_full --overwrite \
+  --batch-size=4 --data.rlds-shuffle-buffer-size=32000
 ```
+
+LoRA / CRI-F comparison is a later step (`pi05_droid_cri_finetune`).
 
 ### Full DROID 1.0.1 + CRI sidecar (TacVLA-style tokens)
 
 Fixed layout used by this workspace:
 
-- DROID RLDS: `/media/safetics/D/droid/1.0.1`
-- CRI addon: `/mnt/E/droid_1.0.1_cri_addon` (legacy: `/media/safetics/E/...`)
+- DROID RLDS: `/media/safetics/D/droid/1.0.1` (original TFRecords; CRI is a sidecar, not inlined)
+- CRI addon: `/mnt/E/droid_1.0.1_cri_addon_v3` (1-step delayed `cri_pre`; legacy v2: `/mnt/E/droid_1.0.1_cri_addon`)
+- PolaRiS RLDS: `/mnt/E/rlds/polaris_droid_cotrain_dataset/1.0.0`
+- PolaRiS CRI addon: `/mnt/E/rlds/polaris_droid_cotrain_dataset_cri_addon_v3`
 - Pretrained init (`pi05_droid`, ~12 GiB): `/mnt/E/openpi/pretrained/pi05_droid`
 - Checkpoints: `/mnt/E/openpi/checkpoints/pi05_droid_cri_finetune/<exp_name>`
 
-CRI is fused like TacVLA's compact non-vision tokens: discrete LLM span
-`Task: ..., State: ..., CRI: <9 bins>;` on top of `pi05_droid` + LoRA
+CRI is fused like TacVLA's compact non-vision tokens, but always on (no
+contact/risk gate): language stays `Task: ..., State: ...;` and CRI is a
+separate MLP prefix stream on top of `pi05_droid` + LoRA
 (config `pi05_droid_cri_finetune`).
 
 Keep the init checkpoint on E: so training does not download into `~/.cache`
@@ -64,14 +75,24 @@ mkdir -p /mnt/E/openpi/pretrained/pi05_droid
 gsutil -m cp -r gs://openpi-assets/checkpoints/pi05_droid/* \
   /mnt/E/openpi/pretrained/pi05_droid/
 
-# Build sidecar once (if needed; resumable)
+# Build CRI-F sidecar once (delayed cri_pre, CBF-QP off, limit 0.96; resumable)
 uv run --group rlds python -m openpi.cri.annotate_rlds_addon \
   --source-dir=/media/safetics/D/droid/1.0.1 \
-  --addon-dir=/mnt/E/droid_1.0.1_cri_addon
+  --addon-dir=/mnt/E/droid_1.0.1_cri_addon_v3 \
+  --cri-limit=0.96 \
+  --no-filter-enabled
 
-# Start training (norm stats + LoRA fine-tune)
+# PolaRiS cotrain: add the same delayed cri_pre next to /mnt/E/rlds (original 1.0.0 stays)
+uv run --group rlds python -m openpi.cri.annotate_rlds_addon \
+  --source-dir=/mnt/E/rlds/polaris_droid_cotrain_dataset/1.0.0 \
+  --addon-dir=/mnt/E/rlds/polaris_droid_cotrain_dataset_cri_addon_v3 \
+  --cri-limit=0.96 \
+  --no-filter-enabled
+
+# LoRA fine-tune on the v3 sidecar (checkpoint every 10k, 50k steps)
 uv run --group rlds scripts/train_pi05_droid_cri.py \
-  --exp-name=droid_cri_lora --overwrite
+  --exp-name=droid_cri_v3_lora --overwrite --monitor \
+  --num-train-steps=50000 --save-interval=10000 --keep-period=10000
 ```
 
 ### Debug: pi0.5-base on `droid_100` + CRI (RLDS)
@@ -81,9 +102,9 @@ Before full-scale DROID+CRI training, smoke-test the pipeline on the annotated s
 
 This is the sibling of the custom LeRobot entrypoint
 `uv run scripts/train.py pi05_droid_finetune --exp-name=my_experiment --overwrite`,
-but uses RLDS + `pi05_base`. CRI is **not** concatenated into continuous state; it is
-encoded as a separate discrete language span:
-`Task: ..., State: ..., CRI: <9 bins>;\nAction: `.
+but uses RLDS + `pi05_base`. CRI is **not** concatenated into continuous state and
+is **not** language-binned; it is an always-on prefix stream next to
+`Task: ..., State: ...;\nAction: `.
 
 ```bash
 # One-shot helper (norm stats + short train)
@@ -175,5 +196,19 @@ To launch training:
 uv run scripts/train.py pi05_droid_finetune --exp-name=my_experiment --overwrite
 ```
 
-Once trained, you can follow the instructions in [`examples/droid/README.md`](examples/droid/README.md) to serve the policy and run it on the robot.
+Once `polaris_cri_lora_20k` finishes (step 20000 on E:), serve it on the GPU box.
+The DROID laptop client is unchanged; the server attaches always-on delayed CRI
+from joint positions.
+
+```bash
+# After training releases the GPU (or pass --wait to poll for 20000)
+uv run scripts/serve_pi05_droid_jointpos_polaris_cri.py --wait
+
+# Equivalent explicit serve_policy call
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi05_droid_jointpos_polaris_cri \
+  --policy.dir=/mnt/E/openpi/checkpoints/pi05_droid_jointpos_polaris_cri/polaris_cri_lora_20k/20000
+```
+
+Then follow [`examples/droid/README.md`](examples/droid/README.md) on the robot laptop.
 
